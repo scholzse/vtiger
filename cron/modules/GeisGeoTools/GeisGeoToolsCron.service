@@ -1,0 +1,450 @@
+<?php
+require_once('include/utils/utils.php');
+require_once('include/logging.php');
+require_once('modules/GeisGeoTools/lib/GeisGeoToolsLib.php');
+
+global $adb, $log;
+$current_user = Users::getActiveAdminUser();
+
+$log = LoggerManager::getLogger('GeisGeoTools');
+$log->info("Starting GeisGeoTools Cron");
+
+$date = new DateTime(); // Get current date
+$today = $date->format('Y-m-d H:i:s'); //Format to MySQL
+
+$log->debug("GeisGeoTools Cron started: $today");
+$log->debug("Starting GeoCoding for Accounts...");
+
+//Beginn with the Accounts
+$Accountquery = "
+(SELECT 
+	account.accountname as 'NAME',
+	billads.bill_street as 'STREET',
+	billads.bill_code as 'PLZ',
+	billads.bill_city as 'CITY',
+	billads.bill_state as 'STATE',
+	billads.bill_country as 'COUNTRY',
+	account.website as 'WEBSITE',
+	account.phone as 'TEL',
+	account.email1 as 'EMAIL',
+	ident.smownerid as 'USERID',
+	account.accountid as 'RECORDID',
+	customefields.cf_705 as 'RATING',
+	case when ggt.recordid is null 
+		then 'insert'
+		else 'update'
+	end as 'ACTION'
+FROM vtiger_account account
+LEFT JOIN vtiger_accountbillads billads
+	ON account.accountid = billads.accountaddressid
+LEFT JOIN vtiger_crmentity ident
+	ON account.accountid = ident.crmid
+LEFT JOIN vtiger_accountscf customefields
+	on account.accountid = customefields.accountid
+LEFT JOIN geis_geotools ggt	
+	ON ggt.recordid	= ident.crmid
+
+
+LEFT JOIN geis_geotools_not_found_data ggtnf	
+	ON  ggtnf.recordid	= ident.crmid
+	and ggtnf.street = billads.bill_street
+	and ggtnf.country = billads.bill_country
+	and ggtnf.postcode = billads.bill_code
+	and ggtnf.city = billads.bill_city
+	and ggtnf.state = billads.bill_state
+WHERE 
+	(
+		(ggt.recordid is null) 
+	or 
+		(
+			ggt.name 	!=	account.accountname
+			or ggt.street	!= 	billads.bill_street
+			or ggt.postcode	!=	billads.bill_code
+			or ggt.city		!=  billads.bill_city 
+			or ggt.state	!=	billads.bill_state
+			or ggt.country	!=  billads.bill_country
+			or ggt.rating != customefields.cf_705
+		)
+	) and ident.deleted = 0
+	and ggtnf.recordid is null
+
+limit 20)
+
+union
+
+(SELECT 
+	account.accountname as 'NAME',
+	billads.bill_street as 'STREET',
+	billads.bill_code as 'PLZ',
+	billads.bill_city as 'CITY',
+	billads.bill_state as 'STATE',
+	billads.bill_country as 'COUNTRY',
+	account.website as 'WEBSITE',
+	account.phone as 'TEL',
+	account.email1 as 'EMAIL',
+	ident.smownerid as 'USERID',
+	account.accountid as 'RECORDID',
+	customefields.cf_705 as 'RATING',
+	'delete' as 'ACTION'
+FROM vtiger_account account
+LEFT JOIN vtiger_accountbillads billads
+	ON account.accountid = billads.accountaddressid
+LEFT JOIN vtiger_crmentity ident
+	ON account.accountid = ident.crmid
+LEFT JOIN vtiger_accountscf customefields
+	on account.accountid = customefields.accountid
+LEFT JOIN geis_geotools ggt	
+	ON ggt.recordid	= ident.crmid
+where 
+	ident.deleted = 1
+	and ggt.recordid is not null) ";
+$Accountresult = $adb->query($Accountquery, array());
+
+while($row = $adb->fetch_row($Accountresult)) {
+		
+		foreach($row as $key => $value)
+		{
+		  $mykey = $key;
+		  $row[$mykey] = html_entity_decode($row[$mykey]);
+		}
+		$NAME = str_replace ("&#039;", "'",$row['name']);;
+		$STATE = $row['state'];
+		$COUNTRY = $row['country'];
+		$WEB = $row['website'];
+		$TEL = $row['tel'];
+		$EMAIL = $row['email'];
+		$USERID = $row['userid'];
+		$RECORDID = $row['recordid'];
+		$STREET = $row['street'];
+		$CITY = $row['city'];
+		$PLZ = $row['plz'];
+		$latlongArray = getOsmGeoLocation($STREET, $CITY, $COUNTRY, $STATE, $PLZ);
+		$LAT = $latlongArray['lat'];
+		$LONG = $latlongArray['long'];
+		$CRAWLER = $latlongArray['crawler'];
+		$STS = $latlongArray['status'];
+		$modifiedtime = $date->format('Y-m-d H:m:s');
+		$RATING = $row['rating'];
+
+		//Wenn Crawl-Status ok, dann versuche Insert oder Update
+		if ($STS == "OK") {
+			if($row['action'] == "insert") {
+				$log->info("[CRAWL-STATUS OK] Insert GeisGeoTools-Account...");
+				InserInGeoToolsTable($RECORDID, $USERID, 'Account', $NAME, $CITY, $PLZ, $STREET, $STATE, $COUNTRY, $LAT, $LONG, $CRAWLER, $RATING);
+			}else if ($row['action'] == "update") {
+				$log->info("[CRAWL-STATUS OK] Update GeisGeoTools-Account...");
+				UpdateInGeoToolsTable($RECORDID, $USERID, 'Account', $NAME, $CITY, $PLZ, $STREET, $STATE, $COUNTRY, $LAT, $LONG, $CRAWLER, $RATING);
+			} else if ($row['action'] == "delete") {
+				$log->info("[CRAWL-STATUS OK] Delete GeisGeoTools-Account...");
+				DeleteInGeoToolsTable($RECORDID);
+			}
+			// Es ging gut, nun löschen wir in der NotFound Tabele wenn vorhanden
+			DeleteInNotFoundTable($RECORDID); 
+		}else{
+			$log->info("[CRAWL-STATUS NOT OK] Insert GeisGeoTools_NOT_FOUND_TABLE...");
+			$log->info("[CRAWL-STATUS NOT OK] Check if Recordid exists");
+			
+			$FOUND = CheckIfNotInNotFoundTable($RECORDID);
+			if ($FOUND == "true") {
+				$log->info("[CRAWL-STATUS NOT OK] Recordid not found insert ok!");
+				InserInNotFoundTable($RECORDID, $USERID, 'Account', $NAME, $CITY, $PLZ, $STREET, $STATE, $COUNTRY);			
+			}else{
+				$log->info("[CRAWL-STATUS NOT OK] Recordid found must delete!");
+				$log->info("[CRAWL-STATUS NOT OK] Delete Recordid: " . $RECORDID);
+				DeleteInNotFoundTable($RECORDID);
+				$log->info("[CRAWL-STATUS NOT OK] RECORDID: " . $RECORDID . " deleted Insert!");
+				InserInNotFoundTable($RECORDID, $USERID, 'Account', $NAME, $CITY, $PLZ, $STREET, $STATE, $COUNTRY);
+			}
+	
+		}
+}
+
+$log->info("Starting GeoCoding for Contacts...");
+//Beginn mit den Contacts
+
+
+$Contactquery = "
+(SELECT 
+	Concat(Concat(contact.firstname, ' '),contact.lastname) as 'NAME',
+	address.mailingstreet as 'STREET',
+	address.mailingzip as 'PLZ',
+	address.mailingcity as 'CITY',
+	address.mailingstate as 'STATE',
+	address.mailingcountry as 'COUNTRY',
+	'-' as 'WEBSITE',
+	contact.phone as 'TEL',
+	contact.email as 'EMAIL',
+	ident.smownerid as 'USERID',
+	contact.contactid as 'RECORDID',
+	case when ggt.recordid is null 
+		then 'insert'
+		else 'update'
+	end as 'ACTION'	
+FROM vtiger_contactdetails contact
+	LEFT JOIN vtiger_contactaddress address
+		ON contact.contactid = address.contactaddressid
+	LEFT JOIN vtiger_crmentity ident
+		ON contact.contactid = ident.crmid
+	LEFT JOIN geis_geotools ggt	
+		ON ggt.recordid	= ident.crmid
+
+		LEFT JOIN geis_geotools_not_found_data ggtnf	
+			ON  ggtnf.recordid	= ident.crmid
+			and ggtnf.street = address.mailingstreet
+			and ggtnf.country = address.mailingcountry
+			and ggtnf.postcode = address.mailingzip
+			and ggtnf.city = address.mailingcity
+			and ggtnf.state = address.mailingstate
+WHERE 
+    (
+		(ggt.recordid is null) 
+		or 
+			(
+				ggt.name 	!=	Concat(Concat(contact.firstname, ' '),contact.lastname)
+			or ggt.street	!= 	address.mailingstreet
+			or ggt.postcode	!=	address.mailingzip
+			or ggt.city		!=  address.mailingcity 
+			or ggt.state	!=	address.mailingstate
+			or ggt.country	!=  address.mailingcountry
+			)
+	) and ident.deleted = 0
+    and ggtnf.recordid is null
+limit 20)
+
+union  
+
+(SELECT 
+	Concat(Concat(contact.firstname, ' '),contact.lastname) as 'NAME',
+	address.mailingstreet as 'STREET',
+	address.mailingzip as 'PLZ',
+	address.mailingcity as 'CITY',
+	address.mailingstate as 'STATE',
+	address.mailingcountry as 'COUNTRY',
+	'-' as 'WEBSITE',
+	contact.phone as 'TEL',
+	contact.email as 'EMAIL',
+	ident.smownerid as 'USERID',
+	contact.contactid as 'RECORDID',
+	'delete' as 'ACTION'	
+FROM vtiger_contactdetails contact
+	LEFT JOIN vtiger_contactaddress address
+		ON contact.contactid = address.contactaddressid
+	LEFT JOIN vtiger_crmentity ident
+		ON contact.contactid = ident.crmid
+	LEFT JOIN geis_geotools ggt	
+		ON ggt.recordid	= ident.crmid
+where 
+		ident.deleted = 1
+	and ggt.recordid is not null)";
+$Contactresult = $adb->pquery($Contactquery, array());
+$noofrow = $adb->num_rows($Contactresult);
+while($row = $adb->fetch_row($Contactresult)) {
+
+
+	foreach($row as $key => $value)
+	{
+	  $mykey = $key;
+	  $row[$mykey] = html_entity_decode($row[$mykey]);
+	}
+	$NAME = str_replace ("&#039;", "'",$row['name']);;	
+	$STATE = $row['state'];
+	$COUNTRY = $row['country'];
+	$WEB = $row['website'];
+	$TEL = $row['tel'];
+	$EMAIL = $row['email'];
+	$USERID = $row['userid'];
+	$RECORDID = $row['recordid'];
+	$STREET = $row['street'];
+	$CITY = $row['city'];
+	$PLZ = $row['plz'];
+	$latlongArray = getOsmGeoLocation($STREET, $CITY, $COUNTRY, $STATE, $PLZ);
+	$LAT = $latlongArray['lat'];
+	$LONG = $latlongArray['long'];
+	$CRAWLER = $latlongArray['crawler'];
+	$STS = $latlongArray['status'];
+	$modifiedtime = $date->format('Y-m-d H:m:s');
+	//Wenn Crawl-Status ok, dann versuche Insert oder Update
+	if ($STS == "OK") {
+		if($row['action'] == "insert") {
+			$log->info("[CRAWL-STATUS OK] Insert GeisGeoTools-Contact...");
+			InserInGeoToolsTable($RECORDID, $USERID, 'Contact', $NAME, $CITY, $PLZ, $STREET, $STATE, $COUNTRY, $LAT, $LONG, $CRAWLER);
+		}else if ($row['action'] == "update") {
+			$log->info("[CRAWL-STATUS OK] Update GeisGeoTools-Contact...");
+			UpdateInGeoToolsTable($RECORDID, $USERID, 'Contact', $NAME, $CITY, $PLZ, $STREET, $STATE, $COUNTRY, $LAT, $LONG, $CRAWLER);
+		} else if ($row['action'] == "delete") {
+			$log->info("[CRAWL-STATUS OK] Delete GeisGeoTools-Contact...");
+			DeleteInGeoToolsTable($RECORDID);
+		}
+		// Es ging gut, nun löschen wir in der NotFound Tabele wenn vorhanden
+		DeleteInNotFoundTable($RECORDID); 
+	}else{
+		$log->info("[CRAWL-STATUS NOT OK] Insert GeisGeoTools_NOT_FOUND_TABLE...");
+		$log->info("[CRAWL-STATUS NOT OK] Check if Recordid exists");
+		
+		$FOUND = CheckIfNotInNotFoundTable($RECORDID);
+		if ($FOUND == "true") {
+			$log->info("[CRAWL-STATUS NOT OK] Recordid not found insert ok!");
+			InserInNotFoundTable($RECORDID, $USERID, 'Contact', $NAME, $CITY, $PLZ, $STREET, $STATE, $COUNTRY);			
+		}else{
+			$log->info("[CRAWL-STATUS NOT OK] Recordid found must delete!");
+			$log->info("[CRAWL-STATUS NOT OK] Delete Recordid: " . $RECORDID);
+			DeleteInNotFoundTable($RECORDID);
+			$log->info("[CRAWL-STATUS NOT OK] RECORDID: " . $RECORDID . " deleted Insert!");
+			InserInNotFoundTable($RECORDID, $USERID, 'Contact', $NAME, $CITY, $PLZ, $STREET, $STATE, $COUNTRY);
+		}
+
+	}
+}	
+$log->info("Starting GeoCoding for Leads...");
+//Beginn mit den Leads
+
+
+$Leadquery = "
+(SELECT 
+	Concat(Concat(lead.firstname, ' '),lead.lastname) as 'NAME',
+	address.lane as 'STREET',
+	address.code as 'PLZ',
+	address.city as 'CITY',
+	address.state as 'STATE',
+	address.country as 'COUNTRY',
+	'-' as 'WEBSITE',
+	address.phone as 'TEL',
+	lead.email as 'EMAIL',
+	ident.smownerid as 'USERID',
+	lead.leadid as 'RECORDID',
+	case when ggt.recordid is null 
+		then 'insert'
+		else 'update'
+	end as 'ACTION'	
+FROM vtiger_leaddetails lead
+	LEFT JOIN vtiger_leadaddress address
+		ON lead.leadid = address.leadaddressid
+	LEFT JOIN vtiger_crmentity ident
+		ON lead.leadid = ident.crmid
+	LEFT JOIN geis_geotools ggt	
+		ON ggt.recordid	= ident.crmid
+
+		LEFT JOIN geis_geotools_not_found_data ggtnf	
+			ON  ggtnf.recordid	= ident.crmid
+			and ggtnf.street = address.lane
+			and ggtnf.country = address.country
+			and ggtnf.postcode = address.code
+			and ggtnf.city = address.city
+			and ggtnf.state = address.state
+WHERE 
+    (
+		(ggt.recordid is null) 
+		or 
+			(
+				ggt.name 	!=	Concat(Concat(lead.firstname, ' '),lead.lastname)
+			or ggt.street	!= 	address.lane
+			or ggt.postcode	!=	address.code
+			or ggt.city		!=  address.city 
+			or ggt.state	!=	address.state
+			or ggt.country	!=  address.country
+			)
+	) and ident.deleted = 0
+    and ggtnf.recordid is null
+limit 20)
+
+union  
+
+(SELECT 
+	Concat(Concat(lead.firstname, ' '),lead.lastname) as 'NAME',
+	address.lane as 'STREET',
+	address.code as 'PLZ',
+	address.city as 'CITY',
+	address.state as 'STATE',
+	address.country as 'COUNTRY',
+	'-' as 'WEBSITE',
+	address.phone as 'TEL',
+	lead.email as 'EMAIL',
+	ident.smownerid as 'USERID',
+	lead.leadid as 'RECORDID',
+	'delete' as 'ACTION'	
+FROM vtiger_leaddetails lead
+	LEFT JOIN vtiger_leadaddress address
+		ON lead.leadid = address.leadaddressid
+	LEFT JOIN vtiger_crmentity ident
+		ON lead.leadid = ident.crmid
+	LEFT JOIN geis_geotools ggt	
+		ON ggt.recordid	= ident.crmid
+where 
+		ident.deleted = 1
+	and ggt.recordid is not null)";
+$Leadresult = $adb->pquery($Leadquery, array());
+$noofrow = $adb->num_rows($Leadresult);
+while($row = $adb->fetch_row($Leadresult)) {
+
+
+	foreach($row as $key => $value)
+	{
+	  $mykey = $key;
+	  $row[$mykey] = html_entity_decode($row[$mykey]);
+	}
+	$NAME = str_replace ("&#039;", "'",$row['name']);;	
+	$STATE = $row['state'];
+	$COUNTRY = $row['country'];
+	$WEB = $row['website'];
+	$TEL = $row['tel'];
+	$EMAIL = $row['email'];
+	$USERID = $row['userid'];
+	$RECORDID = $row['recordid'];
+	$STREET = $row['street'];
+	$CITY = $row['city'];
+	$PLZ = $row['plz'];
+	$latlongArray = getOsmGeoLocation($STREET, $CITY, $COUNTRY, $STATE, $PLZ);
+	$LAT = $latlongArray['lat'];
+	$LONG = $latlongArray['long'];
+	$CRAWLER = $latlongArray['crawler'];
+	$STS = $latlongArray['status'];
+	$modifiedtime = $date->format('Y-m-d H:m:s');
+	//Wenn Crawl-Status ok, dann versuche Insert oder Update
+	if ($STS == "OK") {
+		if($row['action'] == "insert") {
+			$log->info("[CRAWL-STATUS OK] Insert GeisGeoTools-Lead...");
+			InserInGeoToolsTable($RECORDID, $USERID, 'Lead', $NAME, $CITY, $PLZ, $STREET, $STATE, $COUNTRY, $LAT, $LONG, $CRAWLER);
+		}else if ($row['action'] == "update") {
+			$log->info("[CRAWL-STATUS OK] Update GeisGeoTools-Lead...");
+			UpdateInGeoToolsTable($RECORDID, $USERID, 'Lead', $NAME, $CITY, $PLZ, $STREET, $STATE, $COUNTRY, $LAT, $LONG, $CRAWLER);
+		} else if ($row['action'] == "delete") {
+			$log->info("[CRAWL-STATUS OK] Delete GeisGeoTools-Lead...");
+			DeleteInGeoToolsTable($RECORDID);
+		}
+		// Es ging gut, nun löschen wir in der NotFound Tabele wenn vorhanden
+		DeleteInNotFoundTable($RECORDID); 
+	}else{
+		$log->info("[CRAWL-STATUS NOT OK] Insert GeisGeoTools_NOT_FOUND_TABLE...");
+		$log->info("[CRAWL-STATUS NOT OK] Check if Recordid exists");
+		
+		$FOUND = CheckIfNotInNotFoundTable($RECORDID);
+		if ($FOUND == "true") {
+			$log->info("[CRAWL-STATUS NOT OK] Recordid not found insert ok!");
+			InserInNotFoundTable($RECORDID, $USERID, 'Lead', $NAME, $CITY, $PLZ, $STREET, $STATE, $COUNTRY);			
+		}else{
+			$log->info("[CRAWL-STATUS NOT OK] Recordid found must delete!");
+			$log->info("[CRAWL-STATUS NOT OK] Delete Recordid: " . $RECORDID);
+			DeleteInNotFoundTable($RECORDID);
+			$log->info("[CRAWL-STATUS NOT OK] RECORDID: " . $RECORDID . " deleted Insert!");
+			InserInNotFoundTable($RECORDID, $USERID, 'Lead', $NAME, $CITY, $PLZ, $STREET, $STATE, $COUNTRY);
+		}
+
+	}
+}	
+	
+/*
+$log->info("[DELETE] Delete Rows in geis_geotools_not_found_data where InnerJoin geis-geotools");
+$queryDelete = "DELETE geis_geotools_not_found_data
+				FROM geis_geotools_not_found_data INNER JOIN geis_geotools
+					ON geis_geotools_not_found_data.recordid = geis_geotools.recordid";
+$rs = $adb->query($queryDelete , array());
+if (!$rs) {
+	$log->info("Error on Delete geis_geotools_not_found_data: $queryDelete ");
+}			
+*/
+
+//Set end Message
+$todayafter = $date->format('Y-m-d H:i:s'); //Format to MySQL
+$log->debug("GeisGeoTools Cron end: $todayafter");
+
+?>
