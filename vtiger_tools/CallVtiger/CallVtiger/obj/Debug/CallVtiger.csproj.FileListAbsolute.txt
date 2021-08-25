@@ -1,0 +1,6 @@
+C:\___tmp\CallVtiger\CallVtiger\bin\Debug\CallVtiger.exe.config
+C:\___tmp\CallVtiger\CallVtiger\obj\Debug\CallVtiger.csprojResolveAssemblyReference.cache
+C:\___tmp\CallVtiger\CallVtiger\bin\Debug\CallVtiger.exe
+C:\___tmp\CallVtiger\CallVtiger\bin\Debug\CallVtiger.pdb
+C:\___tmp\CallVtiger\CallVtiger\obj\Debug\CallVtiger.exe
+C:\___tmp\CallVtiger\CallVtiger\obj\Debug\CallVtiger.pdb
